@@ -38,7 +38,7 @@ def home():
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
 
-    # Save uploaded PDF
+    # Save uploaded PDF temporarily
     file_path = os.path.join(UPLOAD_FOLDER, file.filename)
 
     with open(file_path, "wb") as f:
@@ -55,44 +55,54 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     # Guard: check if any text was extracted
     if not text.strip():
+        # Clean up the file even on failure
+        if os.path.exists(file_path):
+            os.remove(file_path)
         raise HTTPException(
             status_code=400,
             detail="Could not extract text from this PDF. It may be a scanned image-based PDF."
         )
 
-    # Chunk text — filter out empty chunks
+    # Chunk text WITH OVERLAP so answers aren't split across chunk boundaries
     chunk_size = 500
+    overlap = 100
     chunks = []
 
-    for i in range(0, len(text), chunk_size):
+    i = 0
+    while i < len(text):
         chunk = text[i:i + chunk_size].strip()
         if chunk:
             chunks.append(chunk)
+        i += chunk_size - overlap  # move forward with overlap
 
     # Guard: check if chunks were created
     if not chunks:
+        if os.path.exists(file_path):
+            os.remove(file_path)
         raise HTTPException(
             status_code=400,
             detail="No valid text chunks could be created from this PDF."
         )
 
-    # Delete existing chunks for this file to avoid duplicates on re-upload
+    # Clear ALL previous chunks — this app works on ONE active document at a time.
+    # This fixes the old bug where a new PDF's chunks were mixed with the old one.
     try:
         existing = collection.get()
-        ids_to_delete = [
-            id for id in existing["ids"]
-            if id.startswith(file.filename)
-        ]
-        if ids_to_delete:
-            collection.delete(ids=ids_to_delete)
+        if existing["ids"]:
+            collection.delete(ids=existing["ids"])
     except Exception:
         pass
 
-    # Store chunks in ChromaDB
+    # Store new chunks in ChromaDB
     collection.add(
         documents=chunks,
         ids=[f"{file.filename}_{i}" for i in range(len(chunks))]
     )
+
+    # Delete the raw PDF file from disk — we've already extracted and stored
+    # everything we need in ChromaDB, so there's no reason to keep it around.
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
     return {
         "message": "PDF uploaded successfully",
@@ -109,13 +119,36 @@ def get_chunks():
     }
 
 
+@app.post("/clear")
+def clear_document():
+    """
+    Clears the currently indexed document. Call this from the frontend
+    when the user navigates away or closes the tab (e.g. via a
+    `beforeunload` event using navigator.sendBeacon), so nothing lingers
+    once they're done with it.
+    """
+    try:
+        existing = collection.get()
+        if existing["ids"]:
+            collection.delete(ids=existing["ids"])
+        return {"message": "Document cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
 
     results = collection.query(
         query_texts=[request.question],
-        n_results=3
+        n_results=5
     )
+
+    if not results["documents"] or not results["documents"][0]:
+        return {
+            "question": request.question,
+            "answer": "No document has been uploaded yet. Please upload a PDF first."
+        }
 
     context = "\n".join(results["documents"][0])
 
